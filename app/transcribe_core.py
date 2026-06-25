@@ -13,10 +13,15 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
 ProgressCb = Callable[[str, float, str], None]
+
+# 项目根；OpenVINO 转换后的 whisper 模型放在 .ovmodels/whisper-<size>-fp16-ov/
+_ROOT = Path(__file__).resolve().parent.parent
+_OVMODELS = _ROOT / ".ovmodels"
 
 # vtt/srt 清洗用的正则
 _TAG = re.compile(r"<[^>]+>")
@@ -86,6 +91,15 @@ def _is_douyin(url: str) -> bool:
     return "douyin.com" in url
 
 
+def _is_douyin_user(url: str) -> bool:
+    """抖音用户主页链接（要批量抓该号全部/区间内作品）。
+
+    主页形如 douyin.com/user/<sec_uid>。注意排除「主页弹窗看单条」的
+    douyin.com/user/<sec_uid>?modal_id=<id> —— 那其实是单作品，不是要批量。
+    """
+    return "douyin.com/user/" in url and "modal_id=" not in url
+
+
 def _normalize_douyin(url: str) -> str:
     """把各种抖音链接归一成 f2 认的单作品链接。
 
@@ -135,6 +149,25 @@ def _ffprobe_duration(media: Path) -> float:
         return 0.0
 
 
+def _safe_name(title: str) -> str:
+    """标题转成安全文件名（去非法字符、限长）。"""
+    return re.sub(r'[/\\:*?"<>|]', "_", title)[:60].strip() or "video"
+
+
+def _write_transcript(outdir: Path, title: str, source: str,
+                      method: str, body: str) -> Path:
+    """把文字稿落盘，重名自动加序号，返回最终路径。"""
+    header = f"# 标题: {title}\n# 来源: {source}\n# 方式: {method}\n\n"
+    safe = _safe_name(title)
+    final = outdir / f"{safe}.txt"
+    n = 1
+    while final.exists():
+        final = outdir / f"{safe}_{n}.txt"
+        n += 1
+    final.write_text(header + body.strip() + "\n", encoding="utf-8")
+    return final
+
+
 def _f2_download(url: str, work: Path, cookie_header: str,
                  progress_cb: ProgressCb) -> tuple[str, Path]:
     """抖音：用 f2 下载单条视频，返回 (标题, mp4路径)。"""
@@ -142,7 +175,7 @@ def _f2_download(url: str, work: Path, cookie_header: str,
     progress_cb("downloading_audio", 5, "抖音：用 f2 下载视频…")
     dl = work / "dl"
     cmd = ["f2", "dy", "-M", "one", "-u", url, "-p", str(dl),
-           "-m", "false", "-v", "false", "-d", "true"]
+           "-m", "false", "-v", "false", "-d", "true", "-r", "5", "-e", "60"]
     if cookie_header:
         cmd += ["-k", cookie_header]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -189,19 +222,102 @@ def _to_simplified(text: str) -> str:
         return text
 
 
+# ---- OpenVINO + Intel GPU 引擎（核显/Arc 加速；实测 small 比 CPU 快约 2.6x）----
+_OV_DEVICES = None
+_OV_PIPE_CACHE: dict = {}
+# 单块 iGPU：并发 generate 既不安全也无意义，GPU 推理一律串行
+_OV_LOCK = threading.Lock()
+
+
+def _ov_devices() -> list:
+    """OpenVINO 可见设备，结果缓存。没装 openvino 就返回空列表。"""
+    global _OV_DEVICES
+    if _OV_DEVICES is None:
+        try:
+            import openvino as ov
+            _OV_DEVICES = list(ov.Core().available_devices)
+        except Exception:
+            _OV_DEVICES = []
+    return _OV_DEVICES
+
+
+def _ov_model_dir(model: str) -> Optional[Path]:
+    """该尺寸的 OpenVINO 模型目录（encoder/decoder 权重齐全才算数），没有返回 None。"""
+    d = _OVMODELS / f"whisper-{model}-fp16-ov"
+    if (d / "openvino_encoder_model.bin").exists() and \
+       (d / "openvino_decoder_model.bin").exists():
+        return d
+    return None
+
+
+def _load_audio_16k(media: Path):
+    """ffmpeg 把任意音/视频解码成 16kHz 单声道 float32（OpenVINO whisper 要这个格式）。"""
+    import numpy as np
+    cmd = ["ffmpeg", "-nostdin", "-i", str(media),
+           "-f", "f32le", "-ac", "1", "-ar", "16000", "-"]
+    proc = subprocess.run(cmd, capture_output=True)
+    audio = np.frombuffer(proc.stdout, dtype=np.float32)
+    if audio.size == 0:
+        raise RuntimeError("ffmpeg 没解出音频")
+    return audio
+
+
+def _whisper_media_openvino(media: Path, model: str,
+                            duration: float, progress_cb: ProgressCb) -> str:
+    """OpenVINO + Intel GPU 转写。没装 / 没 GPU / 没该尺寸模型 / 空结果都抛异常，
+    交由上层 _whisper_media 回落到 CPU。"""
+    import openvino_genai as og  # 没装就抛 ImportError 给上层
+    mdir = _ov_model_dir(model)
+    if mdir is None:
+        raise FileNotFoundError(f"无 {model} 的 OpenVINO 模型（.ovmodels/）")
+    if "GPU" not in _ov_devices():
+        raise RuntimeError("OpenVINO 未发现 GPU 设备")
+
+    # 解码不占 GPU，放锁外，可与其他任务的解码/下载并行
+    audio = _load_audio_16k(media)
+    mins = duration / 60 if duration > 0 else 0
+
+    with _OV_LOCK:  # GPU 推理串行化（单 iGPU）
+        pipe = _OV_PIPE_CACHE.get(model)
+        if pipe is None:
+            progress_cb("transcribing", 6, f"加载 OpenVINO 模型到 GPU（{model}）…")
+            pipe = og.WhisperPipeline(str(mdir), "GPU")
+            _OV_PIPE_CACHE[model] = pipe  # 缓存：批量逐条转写时只加载一次
+        progress_cb("transcribing", 12,
+                    f"⚡ GPU 转写中…（约 {mins:.1f} 分钟音频，核显比 CPU 快约 2-3 倍）")
+        res = pipe.generate(audio, language="<|zh|>", task="transcribe")
+
+    text = res.texts[0] if getattr(res, "texts", None) else str(res)
+    if not text.strip():
+        raise RuntimeError("OpenVINO 没产出文本")
+    return text
+
+
 def _whisper_media(media: Path, work: Path, model: str,
                    duration: float, progress_cb: ProgressCb) -> str:
-    """对本地音/视频文件转写。优先 faster-whisper（CPU 上快数倍），
-    出问题自动回落到旧的 openai-whisper CLI。输出统一转简体。"""
+    """对本地音/视频文件转写。三层引擎，从快到稳自动回落：
+      1) OpenVINO + Intel GPU（最快，需有 GPU 且 .ovmodels 里有对应尺寸模型）
+      2) faster-whisper（CPU int8）
+      3) 旧 openai-whisper CLI（最稳的兜底）
+    输出统一转简体。"""
     if duration <= 0:
         duration = _ffprobe_duration(media)
+
+    # 1) OpenVINO GPU 优先
+    try:
+        return _to_simplified(_whisper_media_openvino(media, model, duration, progress_cb))
+    except (ImportError, FileNotFoundError):
+        pass  # 没装 openvino / 没该尺寸模型：静默降级到 CPU
+    except Exception as e:
+        progress_cb("transcribing", 8,
+                    f"GPU 转写不可用（{type(e).__name__}），改用 CPU faster-whisper…")
+
+    # 2) faster-whisper CPU
     try:
         text = _whisper_media_faster(media, model, duration, progress_cb)
     except ImportError:
-        # 没装 faster-whisper，静默走旧实现
         text = _whisper_media_openai(media, work, model, duration, progress_cb)
     except Exception as e:
-        # 新引擎跑挂了（模型下载失败/格式不支持等），兜底到旧实现，别让任务直接死
         progress_cb("transcribing", 10,
                     f"faster-whisper 出错（{type(e).__name__}），回落到旧 whisper…")
         text = _whisper_media_openai(media, work, model, duration, progress_cb)
@@ -284,14 +400,12 @@ def extract(url: str, outdir: Path, *, cookies: Optional[str] = None,
             # 抖音：yt-dlp 抓不动，走 f2 下载 + whisper 转写
             progress_cb("fetching_info", 2, "抖音视频，准备用 f2 下载…")
             title, mp4 = _f2_download(url, work, _cookie_header(cookies), progress_cb)
-            safe = re.sub(r'[/\\:*?"<>|]', "_", title)[:60].strip() or "video"
             method = f"Whisper({model})"
             body = _whisper_media(mp4, work, model, 0.0, progress_cb)
         else:
             # B站/通用：先抓字幕，没有再 whisper
             progress_cb("fetching_info", 2, "获取视频信息…")
             title, duration = _run_info(url, cookies)
-            safe = re.sub(r'[/\\:*?"<>|]', "_", title)[:60].strip() or "video"
 
             progress_cb("trying_subs", 8, "尝试抓取字幕…")
             method = "官方/AI字幕"
@@ -300,13 +414,68 @@ def extract(url: str, outdir: Path, *, cookies: Optional[str] = None,
                 method = f"Whisper({model})"
                 body = _whisper_audio(url, work, cookies, model, duration, progress_cb)
 
-        header = f"# 标题: {title}\n# 来源: {url}\n# 方式: {method}\n\n"
-        final = outdir / f"{safe}.txt"
-        n = 1
-        while final.exists():  # 重名加序号
-            final = outdir / f"{safe}_{n}.txt"
-            n += 1
-        final.write_text(header + body.strip() + "\n", encoding="utf-8")
+        final = _write_transcript(outdir, title, url, method, body)
+        progress_cb("done", 100, f"完成（{method}）")
+        return final
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def download_douyin_user(url: str, work: Path, cookie_header: str,
+                         interval: str, progress_cb: ProgressCb = _noop
+                         ) -> list[tuple[str, Path]]:
+    """抖音用户主页：用 f2 -M post 抓该号在日期区间内的作品。
+
+    interval 形如 'YYYY-MM-DD|YYYY-MM-DD'，传 'all' 抓全部。
+    只下视频不转写，返回 [(标题, mp4路径), ...]，按创建时间(文件名)排序。
+    """
+    progress_cb("fetching_info", 3, f"抖音主页：f2 抓取作品列表（{interval}）…")
+    dl = work / "user"
+    cmd = ["f2", "dy", "-M", "post", "-u", url, "-p", str(dl),
+           "-m", "false", "-v", "false", "-d", "true", "-i", interval,
+           # 重试5次+超时60s：实测能把 f2 批量下载的 0 字节空文件率从一大半降到 0
+           "-r", "5", "-e", "60"]
+    if cookie_header:
+        cmd += ["-k", cookie_header]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    results: list[tuple[str, Path]] = []
+    skipped = 0
+    for mp4 in sorted(dl.rglob("*.mp4")):
+        if mp4.stat().st_size == 0:
+            skipped += 1  # f2 偶发仍会下成 0 字节空壳，跳过，别塞给 whisper 假失败
+            continue
+        # f2 命名为 "{YYYY-MM-DD HH-MM-SS}_{标题}_video.mp4"，直接从文件名取标题
+        # （每条各不相同；不要用 glob 找 desc，否则所有作品会取到同一个文件）
+        stem = mp4.stem
+        prefix = stem[:-6] if stem.endswith("_video") else stem
+        m = re.match(r"^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}_(.+)$", prefix)
+        title = (m.group(1) if m else prefix).strip() or mp4.stem
+        title = re.split(r"\.{3,}", title)[0].strip() or title  # 去 f2 长名截断的重复尾
+        results.append((title, mp4))
+    if skipped:
+        progress_cb("fetching_info", 4, f"（{skipped} 条下载失败的空文件已跳过）")
+
+    if not results:
+        tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
+        hint = " / ".join(t.strip() for t in tail)[:300]
+        raise RuntimeError(
+            "没抓到作品（f2 -M post 返回空）。可能原因："
+            f"主页链接不对/该区间内无作品/cookies 失效。f2: {hint}")
+    return results
+
+
+def transcribe_file(media: Path, title: str, source: str, outdir: Path, *,
+                    model: str = "medium",
+                    progress_cb: ProgressCb = _noop) -> Path:
+    """对已下载到本地的音/视频文件直接 Whisper 转写并落稿。
+    批量抖音展开后，每条视频走这里（跳过下载阶段）。"""
+    outdir.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="tr_"))
+    try:
+        method = f"Whisper({model})"
+        body = _whisper_media(media, work, model, 0.0, progress_cb)
+        final = _write_transcript(outdir, title, source, method, body)
         progress_cb("done", 100, f"完成（{method}）")
         return final
     finally:
@@ -323,4 +492,7 @@ def tools_status() -> dict:
         "f2": shutil.which("f2") is not None,
         # faster-whisper 是 Python 库不是命令行，用 find_spec 检测；装了就走加速
         "faster-whisper": importlib.util.find_spec("faster_whisper") is not None,
+        # OpenVINO 能看到 Intel GPU，且至少有一个尺寸的 OV 模型，才算 GPU 加速可用
+        "openvino-gpu": ("GPU" in _ov_devices()) and any(
+            _ov_model_dir(s) for s in ("small", "medium", "large")),
     }

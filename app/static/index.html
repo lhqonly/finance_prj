@@ -19,12 +19,19 @@
     <div class="row">
       <label>Whisper 模型
         <select id="model">
-          <option value="small">small（快，质量一般）</option>
-          <option value="medium" selected>medium（推荐，中文够用）</option>
-          <option value="large">large（最准，最慢）</option>
+          <option value="small" selected>small（⚡GPU 加速，口播够用，推荐）</option>
+          <option value="medium">medium（更准，但走 CPU 较慢）</option>
+          <option value="large">large（最准，最慢，CPU）</option>
         </select>
       </label>
       <button id="go">开始提取</button>
+    </div>
+
+    <div class="row">
+      <label>抖音主页日期区间
+        <input type="date" id="from" /> 至 <input type="date" id="to" />
+      </label>
+      <span class="hint">仅对「douyin.com/user/…」主页链接生效，按区间批量抓该号作品；留空=全部</span>
     </div>
 
     <div id="overall" class="overall hidden">

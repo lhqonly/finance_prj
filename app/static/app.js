@@ -14,8 +14,10 @@ fetch("/api/status").then((r) => r.json()).then((s) => {
     env.innerHTML = `<span class="bad">⚠ 缺少依赖：${need.join("、")}。请先运行 scripts/setup.sh</span>`;
   } else {
     const ck = s.cookies ? "，已加载 cookies.txt" : "，未配置 cookies（B站AI字幕可能需要）";
-    const fw = s["faster-whisper"] ? "，⚡ faster-whisper 加速已启用" : "，未装 faster-whisper（转写较慢）";
-    env.innerHTML = `<span class="good">✓ 依赖就绪${ck}${fw}</span>`;
+    const accel = s["openvino-gpu"] ? "，⚡ Intel GPU 加速已启用"
+      : s["faster-whisper"] ? "，faster-whisper(CPU) 已启用"
+      : "，转写走 CPU（较慢）";
+    env.innerHTML = `<span class="good">✓ 依赖就绪${ck}${accel}</span>`;
   }
 });
 
@@ -33,9 +35,17 @@ async function start() {
   $("#overall").classList.remove("hidden");
   $("#zip").classList.add("hidden");
 
+  // 抖音用户主页批量的日期区间：两端都空=全部；否则缺的一端给个兜底
+  const from = $("#from").value, to = $("#to").value;
+  let interval = "all";
+  if (from || to) {
+    const today = new Date().toISOString().slice(0, 10);
+    interval = `${from || "2016-09-20"}|${to || today}`;
+  }
+
   const res = await fetch("/api/batches", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ urls, model: $("#model").value }),
+    body: JSON.stringify({ urls, model: $("#model").value, interval }),
   });
   if (!res.ok) { alert("提交失败"); $("#go").disabled = false; return; }
   batchId = (await res.json()).batch_id;
@@ -75,7 +85,7 @@ function render(items) {
       : "";
     return `<li class="item">
       <div class="top">
-        <span class="url">${i + 1}. ${escapeHtml(it.url)}</span>
+        <span class="url">${i + 1}. ${it.kind === "douyin_user" ? "📋 " : ""}${escapeHtml(it.label || it.url)}</span>
         <span class="st ${cls}">${stLabel}</span>
       </div>
       <div class="msg">${escapeHtml(it.message || "")}</div>

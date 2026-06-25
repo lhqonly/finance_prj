@@ -13,3 +13,9 @@ transcripts/
 
 # f2 缓存数据库
 *.db
+
+# OpenVINO 转换后的 whisper 模型（几百 MB，按需下载，不入库）
+.ovmodels/
+
+# Intel GPU 编译器(IGC)运行时落下的诊断日志
+kernel.errors.txt
