@@ -175,11 +175,78 @@ def _whisper_audio(url: str, work: Path, cookies: Optional[str], model: str,
     return _whisper_media(audio, work, model, duration, progress_cb)
 
 
+# faster-whisper 的模型按 size 缓存，避免批量任务里反复加载（加载一次 1~2GB 很贵）
+_FW_CACHE: dict = {}
+
+
+def _to_simplified(text: str) -> str:
+    """统一转简体。whisper 中文输出常蹦繁体，简体用户看着别扭，强制归一。
+    没装 zhconv 就原样返回（不硬依赖）。"""
+    try:
+        import zhconv
+        return zhconv.convert(text, "zh-cn")
+    except Exception:
+        return text
+
+
 def _whisper_media(media: Path, work: Path, model: str,
                    duration: float, progress_cb: ProgressCb) -> str:
-    """对本地音/视频文件跑 whisper，解析 verbose 时间戳估算进度。"""
+    """对本地音/视频文件转写。优先 faster-whisper（CPU 上快数倍），
+    出问题自动回落到旧的 openai-whisper CLI。输出统一转简体。"""
     if duration <= 0:
         duration = _ffprobe_duration(media)
+    try:
+        text = _whisper_media_faster(media, model, duration, progress_cb)
+    except ImportError:
+        # 没装 faster-whisper，静默走旧实现
+        text = _whisper_media_openai(media, work, model, duration, progress_cb)
+    except Exception as e:
+        # 新引擎跑挂了（模型下载失败/格式不支持等），兜底到旧实现，别让任务直接死
+        progress_cb("transcribing", 10,
+                    f"faster-whisper 出错（{type(e).__name__}），回落到旧 whisper…")
+        text = _whisper_media_openai(media, work, model, duration, progress_cb)
+    return _to_simplified(text)
+
+
+def _whisper_media_faster(media: Path, model: str,
+                          duration: float, progress_cb: ProgressCb) -> str:
+    """faster-whisper(CTranslate2 + int8 量化 + VAD 静音过滤)。"""
+    from faster_whisper import WhisperModel  # 延迟导入：没装就抛 ImportError 给上层兜底
+
+    wm = _FW_CACHE.get(model)
+    if wm is None:
+        progress_cb("transcribing", 6,
+                    f"加载模型 {model}（首次会下载，约 1~2GB，仅一次）…")
+        # device=cpu + int8：无 GPU 时最快的组合；cpu_threads=0 让 CT2 自适应
+        wm = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=0)
+        _FW_CACHE[model] = wm
+
+    progress_cb("transcribing", 10, f"faster-whisper({model}) 转写中…")
+    segments, info = wm.transcribe(
+        str(media), language="zh", beam_size=5,
+        vad_filter=True,  # 跳过静音段，口播视频提速明显
+    )
+    if duration <= 0:
+        duration = getattr(info, "duration", 0.0) or 0.0
+
+    parts: list[str] = []
+    for seg in segments:  # segments 是惰性生成器，迭代时才真正在转写
+        text = seg.text.strip()
+        if text:
+            parts.append(text)
+        if duration > 0:
+            cur = seg.end
+            pct = max(10.0, min(99.0, 10 + 89 * cur / duration))
+            progress_cb("transcribing", pct,
+                        f"转写中… {cur/60:.1f}/{duration/60:.1f} 分钟")
+    if not parts:
+        raise RuntimeError("faster-whisper 没产出文本")
+    return "\n".join(parts)
+
+
+def _whisper_media_openai(media: Path, work: Path, model: str,
+                          duration: float, progress_cb: ProgressCb) -> str:
+    """旧实现：openai-whisper CLI，解析 verbose 时间戳估算进度。作兜底。"""
     progress_cb("transcribing", 10, f"Whisper({model}) 转写中…（CPU 较慢，请耐心）")
     cmd = [
         "whisper", str(media), "--language", "zh", "--model", model,
@@ -248,9 +315,12 @@ def extract(url: str, outdir: Path, *, cookies: Optional[str] = None,
 
 def tools_status() -> dict:
     """检查依赖是否就绪，给前端提示。"""
+    import importlib.util
     return {
         "yt-dlp": shutil.which("yt-dlp") is not None,
         "whisper": shutil.which("whisper") is not None,
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "f2": shutil.which("f2") is not None,
+        # faster-whisper 是 Python 库不是命令行，用 find_spec 检测；装了就走加速
+        "faster-whisper": importlib.util.find_spec("faster_whisper") is not None,
     }

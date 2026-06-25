@@ -24,9 +24,10 @@ echo ">>> 升级 pip 并安装 yt-dlp + openai-whisper + 网页后端依赖 ..."
 pip install -U pip
 pip install -U yt-dlp openai-whisper fastapi "uvicorn[standard]"
 
-# 没有 GPU，可选装 faster-whisper（CPU 上比 openai-whisper 快好几倍）
-# 想用就取消下一行注释：
-# pip install -U faster-whisper
+# 没有 GPU，装 faster-whisper（CTranslate2 + int8，CPU 上比 openai-whisper 快好几倍）。
+# 后端默认优先用它，跑挂了会自动回落到 openai-whisper。
+# zhconv：whisper 中文输出常蹦繁体，用它统一转简体。
+pip install -U faster-whisper zhconv
 
 echo ""
 echo ">>> 完成。yt-dlp $(yt-dlp --version)"

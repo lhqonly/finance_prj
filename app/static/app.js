@@ -14,7 +14,8 @@ fetch("/api/status").then((r) => r.json()).then((s) => {
     env.innerHTML = `<span class="bad">⚠ 缺少依赖：${need.join("、")}。请先运行 scripts/setup.sh</span>`;
   } else {
     const ck = s.cookies ? "，已加载 cookies.txt" : "，未配置 cookies（B站AI字幕可能需要）";
-    env.innerHTML = `<span class="good">✓ 依赖就绪${ck}</span>`;
+    const fw = s["faster-whisper"] ? "，⚡ faster-whisper 加速已启用" : "，未装 faster-whisper（转写较慢）";
+    env.innerHTML = `<span class="good">✓ 依赖就绪${ck}${fw}</span>`;
   }
 });
 

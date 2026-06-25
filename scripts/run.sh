@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/.venv"
 # 确保用户级安装的 yt-dlp/whisper/f2 在 PATH 上（后端 subprocess 要调它们）
 export PATH="$HOME/.local/bin:$PATH"
+# faster-whisper 首次下模型走 HuggingFace。新的 xet 后端在本机网络上会挂起，
+# 强制走普通 HTTP 下载（CDN 实测 ~700KB/s 正常）。
+export HF_HUB_DISABLE_XET=1
 
 if [ -d "$VENV" ]; then
   # shellcheck disable=SC1091
