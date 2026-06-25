@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 --version)",
+      "Bash(yt-dlp --version)",
+      "Bash(whisper --help)",
+      "Bash(ffmpeg -version)",
+      "Bash(nvidia-smi --query-gpu=name --format=csv,noheader)"
+    ]
+  }
+}

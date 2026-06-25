@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>视频字幕 / 转写提取器</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <h1>视频字幕 / 转写提取器</h1>
+    <p class="sub">粘贴 B站 / 抖音 视频链接，每行一个。优先抓字幕，没字幕自动 Whisper 转写。</p>
+
+    <div id="env" class="env"></div>
+
+    <textarea id="urls" rows="5"
+      placeholder="https://www.bilibili.com/video/xxxx&#10;https://www.douyin.com/video/yyyy"></textarea>
+
+    <div class="row">
+      <label>Whisper 模型
+        <select id="model">
+          <option value="small">small（快，质量一般）</option>
+          <option value="medium" selected>medium（推荐，中文够用）</option>
+          <option value="large">large（最准，最慢）</option>
+        </select>
+      </label>
+      <button id="go">开始提取</button>
+    </div>
+
+    <div id="overall" class="overall hidden">
+      <div class="bar"><div id="overallFill" class="fill"></div></div>
+      <div class="overall-meta"><span id="overallText">0%</span>
+        <button id="zip" class="link hidden">⬇ 打包下载全部</button></div>
+    </div>
+
+    <ul id="list" class="list"></ul>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

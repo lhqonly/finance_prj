@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 敏感：登录态 cookie，绝不入库
+cookies.txt
+
+# 运行时产物
+logs/
+server.log
+transcripts/
+
+# f2 缓存数据库
+*.db
