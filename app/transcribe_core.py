@@ -8,12 +8,14 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -22,6 +24,9 @@ ProgressCb = Callable[[str, float, str], None]
 # 项目根；OpenVINO 转换后的 whisper 模型放在 .ovmodels/whisper-<size>-fp16-ov/
 _ROOT = Path(__file__).resolve().parent.parent
 _OVMODELS = _ROOT / ".ovmodels"
+
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
 # vtt/srt 清洗用的正则
 _TAG = re.compile(r"<[^>]+>")
@@ -421,47 +426,116 @@ def extract(url: str, outdir: Path, *, cookies: Optional[str] = None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _dy_sec_uid(url: str) -> str:
+    """从抖音主页链接提取 sec_user_id。"""
+    m = re.search(r"/user/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else url
+
+
+def _dy_in_interval(create_time: str, interval: str) -> bool:
+    """create_time 'YYYY-MM-DD ...' 是否落在 interval 'YYYY-MM-DD|YYYY-MM-DD' 内。"""
+    if not interval or interval == "all":
+        return True
+    day = (create_time or "")[:10]
+    lo, _, hi = interval.partition("|")
+    return (not lo or day >= lo) and (not hi or day <= hi)
+
+
+async def _dy_fetch_metas(sec_uid: str, cookie_header: str, interval: str,
+                          progress_cb: ProgressCb) -> list[dict]:
+    """用 f2 SDK 取该用户作品列表（只取信息、不下视频），按日期区间过滤。
+    返回 [{aweme_id, title, music_url, vdur_s}, ...]。"""
+    from f2.apps.douyin.handler import DouyinHandler
+    kwargs = {
+        "headers": {"User-Agent": _UA, "Referer": "https://www.douyin.com/"},
+        "cookie": cookie_header,
+        "proxies": {"http://": None, "https://": None},
+        "timeout": 30, "max_retries": 5, "max_connections": 5, "max_tasks": 5,
+        "page_counts": 20, "mode": "post", "path": "/tmp", "interval": "all",
+    }
+    handler = DouyinHandler(kwargs)
+    metas: list[dict] = []
+    async for page in handler.fetch_user_post_videos(sec_uid, max_counts=0):
+        d = page._to_dict()
+        ids = d.get("aweme_id") or []
+        descs = d.get("desc") or []
+        murls = d.get("music_play_url") or []
+        vdurs = d.get("video_duration") or []
+        ctimes = d.get("create_time") or []
+        for i in range(len(ids)):
+            ct = ctimes[i] if i < len(ctimes) else ""
+            if not _dy_in_interval(ct, interval):
+                continue
+            title = (descs[i] if i < len(descs) else "") or ids[i]
+            title = re.split(r"\.{3,}", title)[0].strip() or ids[i]
+            metas.append({
+                "aweme_id": ids[i],
+                "title": title,
+                "music_url": murls[i] if i < len(murls) else "",
+                "vdur_s": (vdurs[i] if i < len(vdurs) else 0) / 1000,
+            })
+        progress_cb("fetching_info", 4, f"抖音主页：已扫描 {len(metas)} 条匹配作品…")
+        # 作品按发布时间倒序：本页最早一条已早于区间起始，则后面只会更早，停止翻页
+        lo = interval.partition("|")[0] if interval and interval != "all" else ""
+        if lo and ctimes and ctimes[-1][:10] < lo:
+            break
+    return metas
+
+
+def _dy_download_file(url: str, dest: Path) -> bool:
+    """下载 url 到 dest，成功且非空返回 True。"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _UA, "Referer": "https://www.douyin.com/"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as o:
+            shutil.copyfileobj(r, o)
+        return dest.exists() and dest.stat().st_size > 0
+    except Exception:
+        return False
+
+
 def download_douyin_user(url: str, work: Path, cookie_header: str,
                          interval: str, progress_cb: ProgressCb = _noop
                          ) -> list[tuple[str, Path]]:
-    """抖音用户主页：用 f2 -M post 抓该号在日期区间内的作品。
+    """抖音用户主页：取作品列表 → 只下「原声 mp3」（省 ~70% 流量），绕过几十 MB 视频。
 
-    interval 形如 'YYYY-MM-DD|YYYY-MM-DD'，传 'all' 抓全部。
-    只下视频不转写，返回 [(标题, mp4路径), ...]，按创建时间(文件名)排序。
+    原声若不是完整音轨（少数作品配了 BGM、原声时长对不上视频），该条自动
+    回退下视频，保证仍能转写。interval 形如 'YYYY-MM-DD|YYYY-MM-DD' 或 'all'。
+    返回 [(标题, 媒体路径), ...]。
     """
-    progress_cb("fetching_info", 3, f"抖音主页：f2 抓取作品列表（{interval}）…")
-    dl = work / "user"
-    cmd = ["f2", "dy", "-M", "post", "-u", url, "-p", str(dl),
-           "-m", "false", "-v", "false", "-d", "true", "-i", interval,
-           # 重试5次+超时60s：实测能把 f2 批量下载的 0 字节空文件率从一大半降到 0
-           "-r", "5", "-e", "60"]
-    if cookie_header:
-        cmd += ["-k", cookie_header]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    sec_uid = _dy_sec_uid(url)
+    progress_cb("fetching_info", 3, f"抖音主页：取作品列表（{interval}）…")
+    metas = asyncio.run(_dy_fetch_metas(sec_uid, cookie_header, interval, progress_cb))
+    if not metas:
+        raise RuntimeError(
+            "没抓到作品（列表为空）。可能：主页链接不对/该区间内无作品/cookies 失效。")
 
+    work.mkdir(parents=True, exist_ok=True)
     results: list[tuple[str, Path]] = []
-    skipped = 0
-    for mp4 in sorted(dl.rglob("*.mp4")):
-        if mp4.stat().st_size == 0:
-            skipped += 1  # f2 偶发仍会下成 0 字节空壳，跳过，别塞给 whisper 假失败
+    total = len(metas)
+    for i, m in enumerate(metas):
+        pct = min(5 + (i + 1) * 55 // total, 60)
+        progress_cb("downloading_audio", pct,
+                    f"下载原声 {i+1}/{total}：{m['title'][:18]}…")
+        mp3 = work / f"{m['aweme_id']}.mp3"
+        got = bool(m["music_url"]) and _dy_download_file(m["music_url"], mp3)
+        # 校验：原声时长 ≈ 视频时长 → 完整音轨（含口播）；差太多多半是 BGM
+        vs = m["vdur_s"]
+        if got and (vs <= 0 or abs(_ffprobe_duration(mp3) - vs) <= max(3, vs * 0.15)):
+            results.append((m["title"], mp3))
             continue
-        # f2 命名为 "{YYYY-MM-DD HH-MM-SS}_{标题}_video.mp4"，直接从文件名取标题
-        # （每条各不相同；不要用 glob 找 desc，否则所有作品会取到同一个文件）
-        stem = mp4.stem
-        prefix = stem[:-6] if stem.endswith("_video") else stem
-        m = re.match(r"^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}_(.+)$", prefix)
-        title = (m.group(1) if m else prefix).strip() or mp4.stem
-        title = re.split(r"\.{3,}", title)[0].strip() or title  # 去 f2 长名截断的重复尾
-        results.append((title, mp4))
-    if skipped:
-        progress_cb("fetching_info", 4, f"（{skipped} 条下载失败的空文件已跳过）")
+        # 回退：原声非口播 / 下载失败 → 退而下视频
+        progress_cb("downloading_audio", pct, f"#{i+1} 原声非完整音轨，回退下视频…")
+        try:
+            _, mp4 = _f2_download(f"https://www.douyin.com/video/{m['aweme_id']}",
+                                  work / f"v{i}", cookie_header, lambda *a: None)
+            results.append((m["title"], mp4))
+        except Exception:
+            pass  # 原声和视频都没拿到，跳过别污染结果
 
     if not results:
-        tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
-        hint = " / ".join(t.strip() for t in tail)[:300]
-        raise RuntimeError(
-            "没抓到作品（f2 -M post 返回空）。可能原因："
-            f"主页链接不对/该区间内无作品/cookies 失效。f2: {hint}")
+        raise RuntimeError("作品都下载失败（原声和视频都没拿到）。可能 cookies 失效。")
     return results
 
 

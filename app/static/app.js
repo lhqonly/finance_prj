@@ -1,6 +1,7 @@
 const $ = (s) => document.querySelector(s);
 let timer = null;
 let batchId = null;
+let lastMsg = {};  // 每个 item 上次的状态文案，用于日志去重
 
 // 启动时检查后端依赖是否就绪
 fetch("/api/status").then((r) => r.json()).then((s) => {
@@ -32,6 +33,8 @@ async function start() {
 
   $("#go").disabled = true;
   $("#list").innerHTML = "";
+  lastMsg = {};
+  $("#debugBody").innerHTML = "";
   $("#overall").classList.remove("hidden");
   $("#zip").classList.add("hidden");
 
@@ -66,6 +69,7 @@ async function poll() {
     `总进度 ${data.overall}%（完成 ${data.done}/${data.total}${data.error ? `，失败 ${data.error}` : ""}）`;
 
   render(data.items);
+  pushLog(data.items);
 
   const finished = data.done + data.error === data.total;
   if (data.done > 0) $("#zip").classList.remove("hidden");
@@ -83,16 +87,39 @@ function render(items) {
     const dl = it.file
       ? `<a class="dl link" href="/api/download/${encodeURIComponent(it.file)}">⬇ 下载 ${escapeHtml(it.file)}</a>`
       : "";
-    return `<li class="item">
+    const icon = it.state === "running" ? '<span class="spin">◐</span> '
+               : it.state === "queued" ? "⏳ " : "";
+    return `<li class="item ${it.state === "running" ? "running" : ""}">
       <div class="top">
         <span class="url">${i + 1}. ${it.kind === "douyin_user" ? "📋 " : ""}${escapeHtml(it.label || it.url)}</span>
-        <span class="st ${cls}">${stLabel}</span>
+        <span class="st ${cls}">${icon}${stLabel}</span>
       </div>
       <div class="msg">${escapeHtml(it.message || "")}</div>
       <div class="bar"><div class="fill ${cls}" style="width:${it.percent}%"></div></div>
       ${dl}
     </li>`;
   }).join("");
+}
+
+// 把每个任务的状态变化追加到右侧运行日志（变了才记一行）
+function pushLog(items) {
+  const body = $("#debugBody");
+  items.forEach((it, i) => {
+    const msg = `${it.percent}%|${it.message || ""}`;
+    if (lastMsg[i] === msg) return;
+    lastMsg[i] = msg;
+    const cls = it.state === "error" ? "err" : it.state === "done" ? "done" : "";
+    const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    const div = document.createElement("div");
+    div.className = `line ${cls}`;
+    div.innerHTML = `<span class="t">${t}</span>#${i + 1} ${escapeHtml(it.message || "")}`;
+    body.appendChild(div);
+  });
+  if (body.children.length) {
+    $("#debug").classList.remove("hidden");
+    document.body.classList.add("has-debug");
+    body.scrollTop = body.scrollHeight;
+  }
 }
 
 function escapeHtml(s) {

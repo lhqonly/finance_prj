@@ -50,3 +50,26 @@ button:disabled { opacity: .5; cursor: default; }
 .item .fill.done { background: var(--ok); }
 .item .fill.error { background: var(--err); }
 .item .dl { font-size: 13px; margin-top: 8px; display: inline-block; }
+.item.running { border-color: var(--acc); }
+
+/* —— 处理中转圈图标 —— */
+.spin { display: inline-block; animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.item .st .spin { color: var(--acc); }
+
+/* —— 右侧运行日志面板：实时输出后端状态/debug —— */
+#debug {
+  position: fixed; top: 0; right: 0; width: 340px; height: 100vh;
+  background: #0b0e14; border-left: 1px solid var(--line); color: var(--mut);
+  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+  padding: 12px 14px; overflow-y: auto; z-index: 50;
+}
+#debug h3 { color: #e5c07b; margin: 0 0 10px; font-size: 13px;
+  position: sticky; top: 0; background: #0b0e14; padding: 2px 0 6px; }
+#debug .line { white-space: pre-wrap; word-break: break-all; margin-bottom: 4px; }
+#debug .line .t { color: #5c6370; margin-right: 6px; }
+#debug .line.err { color: var(--err); }
+#debug .line.done { color: var(--ok); }
+@media (min-width: 1100px) {
+  body.has-debug .wrap { margin-right: 380px; }
+}
