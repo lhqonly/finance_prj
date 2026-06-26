@@ -43,6 +43,8 @@ class BatchReq(BaseModel):
     model: str = "medium"
     # 抖音用户主页批量抓取的日期区间：'YYYY-MM-DD|YYYY-MM-DD' 或 'all'
     interval: Optional[str] = None
+    # 断点续传：跳过 transcripts/ 里已转写过的作品（重复提交同一主页时省时间）
+    resume: bool = True
 
 
 def _expand_douyin_user(batch_id: str, item: dict, url: str,
@@ -52,7 +54,9 @@ def _expand_douyin_user(batch_id: str, item: dict, url: str,
     # 不能用自动清理的临时目录：子任务转写时还要读这些 mp4，下载完不能删
     work = Path(tempfile.mkdtemp(prefix="dyuser_"))
     cookie = _cookie_header(str(COOKIES) if COOKIES else None)
-    results = download_douyin_user(url, work, cookie, interval, cb)
+    resume = _BATCHES[batch_id].get("resume", True)
+    results = download_douyin_user(url, work, cookie, interval, cb,
+                                   done_dir=OUT if resume else None)
 
     with _lock:
         b = _BATCHES[batch_id]
@@ -127,7 +131,7 @@ def create_batch(req: BatchReq):
             items.append({"url": u, "kind": "single", "label": None,
                           "state": "queued", "stage": "queued", "percent": 0.0,
                           "message": "排队中…", "file": None, "error": None})
-    _BATCHES[batch_id] = {"items": items, "model": req.model}
+    _BATCHES[batch_id] = {"items": items, "model": req.model, "resume": req.resume}
     for i in range(len(items)):
         _pool.submit(_process, batch_id, i)
     return {"batch_id": batch_id, "count": len(items)}

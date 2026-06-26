@@ -496,12 +496,14 @@ def _dy_download_file(url: str, dest: Path) -> bool:
 
 
 def download_douyin_user(url: str, work: Path, cookie_header: str,
-                         interval: str, progress_cb: ProgressCb = _noop
+                         interval: str, progress_cb: ProgressCb = _noop,
+                         done_dir: Optional[Path] = None
                          ) -> list[tuple[str, Path]]:
     """抖音用户主页：取作品列表 → 只下「原声 mp3」（省 ~70% 流量），绕过几十 MB 视频。
 
     原声若不是完整音轨（少数作品配了 BGM、原声时长对不上视频），该条自动
     回退下视频，保证仍能转写。interval 形如 'YYYY-MM-DD|YYYY-MM-DD' 或 'all'。
+    done_dir 非空时启用「断点续传」：跳过该目录下已有同名 .txt 的作品（连下载都省）。
     返回 [(标题, 媒体路径), ...]。
     """
     sec_uid = _dy_sec_uid(url)
@@ -510,6 +512,18 @@ def download_douyin_user(url: str, work: Path, cookie_header: str,
     if not metas:
         raise RuntimeError(
             "没抓到作品（列表为空）。可能：主页链接不对/该区间内无作品/cookies 失效。")
+
+    # 断点续传：跳过已转写过的作品（落稿文件名 = _safe_name(标题)）
+    if done_dir is not None:
+        kept = [m for m in metas
+                if not (done_dir / f"{_safe_name(m['title'])}.txt").exists()]
+        skipped = len(metas) - len(kept)
+        if skipped:
+            progress_cb("fetching_info", 4,
+                        f"断点续传：跳过 {skipped} 条已转写的，待处理 {len(kept)} 条…")
+        metas = kept
+        if not metas:
+            raise RuntimeError("该区间作品都已转写过（断点续传：无新增）。")
 
     work.mkdir(parents=True, exist_ok=True)
     results: list[tuple[str, Path]] = []

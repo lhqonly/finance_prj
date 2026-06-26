@@ -48,7 +48,7 @@ async function start() {
 
   const res = await fetch("/api/batches", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ urls, model: $("#model").value, interval }),
+    body: JSON.stringify({ urls, model: $("#model").value, interval, resume: $("#resume").checked }),
   });
   if (!res.ok) { alert("提交失败"); $("#go").disabled = false; return; }
   batchId = (await res.json()).batch_id;

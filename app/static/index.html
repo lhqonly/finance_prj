@@ -34,6 +34,12 @@
       <span class="hint">仅对「douyin.com/user/…」主页链接生效，按区间批量抓该号作品；留空=全部</span>
     </div>
 
+    <div class="row">
+      <label><input type="checkbox" id="resume" checked /> 断点续传</label>
+      <span class="hint">勾选后跳过 transcripts/ 里<b>已转写过</b>的作品（按标题判断），只补转新增/漏掉的——
+        换更快的模型重新提交同一主页时，已转好的不会重复跑。取消勾选则全部重新转。</span>
+    </div>
+
     <div id="overall" class="overall hidden">
       <div class="bar"><div id="overallFill" class="fill"></div></div>
       <div class="overall-meta"><span id="overallText">0%</span>
