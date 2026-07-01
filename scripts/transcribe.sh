@@ -10,10 +10,10 @@
 #   2) 抓不到字幕，自动降级用 Whisper 把音频转写（抖音口播必走这条）
 #
 # 可选环境变量：
-#   COOKIES=/path/to/cookies.txt   B站AI字幕需要登录态时传入（WSL 推荐导出 cookies.txt）
-#   MODEL=medium                   Whisper 模型: tiny/base/small/medium/large；CPU慢可降到 small
+#   COOKIES=/path/to/cookies.txt   B站AI字幕需要登录态时传入（可从浏览器导出 cookies.txt）
+#   MODEL=small                    Whisper 模型: tiny/base/small/medium/large；macOS 默认 small
 #   SUBLANGS="zh.*,ai.*,Chinese"   想抓的字幕语言
-set -uo pipefail
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/.venv"
@@ -21,11 +21,17 @@ OUT="$ROOT/transcripts"
 WORK="$ROOT/.work"
 SRT2TXT="$ROOT/scripts/srt2txt.py"
 
-MODEL="${MODEL:-medium}"
+MODEL="${MODEL:-small}"
 SUBLANGS="${SUBLANGS:-zh.*,ai.*,Chinese,zh-Hans,zh-CN}"
 COOKIES="${COOKIES:-}"
 
-[ -d "$VENV" ] && source "$VENV/bin/activate"
+if [ -d "$VENV" ]; then
+  # shellcheck disable=SC1091
+  source "$VENV/bin/activate"
+else
+  echo "!!! 未找到 .venv，请先运行：bash scripts/setup.sh"
+  exit 1
+fi
 mkdir -p "$OUT" "$WORK"
 
 # 收集 URL 列表
@@ -80,7 +86,7 @@ for url in "${URLS[@]}"; do
   if [ -n "$sub" ]; then
     echo ">>> 抓到字幕，清洗为文本: $sub"
     { echo "# 标题: $title"; echo "# 来源: $url"; echo "# 方式: 官方/AI字幕"; echo ""; \
-      python3 "$SRT2TXT" "$sub"; } > "$final"
+      python "$SRT2TXT" "$sub"; } > "$final"
     echo ">>> 完成: $final"
     rm -rf "$tmp"
     continue

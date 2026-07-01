@@ -1,0 +1,19 @@
+# macOS runtime dependencies for the transcription app.
+yt-dlp>=2025.6.25
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2
+urllib3<2
+
+# Transcription engines. faster-whisper is the default macOS path; openai-whisper
+# stays installed as a compatibility fallback for files that fail in CT2/PyAV.
+mlx-whisper>=0.4.3; platform_system == "Darwin" and platform_machine == "arm64"
+faster-whisper>=1.1
+openai-whisper>=20240930
+zhconv>=1.4
+
+# Douyin crawler/downloader used by app/transcribe_core.py.
+f2>=0.0.1.6
+
+# Provides a project-local ffmpeg binary on macOS when Homebrew ffmpeg is absent.
+imageio-ffmpeg>=0.5

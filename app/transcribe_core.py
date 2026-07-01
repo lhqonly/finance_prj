@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -143,13 +144,53 @@ def _cookie_header(cookies_path: Optional[str]) -> str:
     return "; ".join(out)
 
 
+def _prepare_f2_douyin() -> None:
+    """Avoid f2's fragile remote msToken probe on macOS.
+
+    f2 tries to POST to mssdk.bytedance.com/web/report while importing Douyin
+    request models. That endpoint can return 503 even when normal douyin.com
+    APIs are reachable, which should not abort our local transcription flow.
+    """
+    try:
+        from f2.apps.douyin.utils import TokenManager
+        TokenManager.gen_real_msToken = classmethod(
+            lambda cls: cls.gen_false_msToken()
+        )
+    except Exception:
+        pass
+
+
+def _f2_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    patch_dir = str(_ROOT / "app" / "f2_runtime_patch")
+    current = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = patch_dir if not current else f"{patch_dir}{os.pathsep}{current}"
+    return env
+
+
 def _ffprobe_duration(media: Path) -> float:
+    def parse_duration(text: str) -> float:
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+        if not match:
+            return 0.0
+        hours, minutes, seconds = match.groups()
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nw=1:nk=1", str(media)],
             capture_output=True, text=True, timeout=60).stdout.strip()
         return float(out)
+    except Exception:
+        pass
+
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-nostdin", "-i", str(media), "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        return parse_duration(proc.stderr)
     except Exception:
         return 0.0
 
@@ -176,6 +217,7 @@ def _write_transcript(outdir: Path, title: str, source: str,
 def _f2_download(url: str, work: Path, cookie_header: str,
                  progress_cb: ProgressCb) -> tuple[str, Path]:
     """抖音：用 f2 下载单条视频，返回 (标题, mp4路径)。"""
+    _prepare_f2_douyin()
     url = _normalize_douyin(url)
     progress_cb("downloading_audio", 5, "抖音：用 f2 下载视频…")
     dl = work / "dl"
@@ -183,7 +225,7 @@ def _f2_download(url: str, work: Path, cookie_header: str,
            "-m", "false", "-v", "false", "-d", "true", "-r", "5", "-e", "60"]
     if cookie_header:
         cmd += ["-k", cookie_header]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=_f2_subprocess_env())
     mp4 = next(iter(dl.rglob("*.mp4")), None)
     if not mp4:
         tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
@@ -215,6 +257,13 @@ def _whisper_audio(url: str, work: Path, cookies: Optional[str], model: str,
 
 # faster-whisper 的模型按 size 缓存，避免批量任务里反复加载（加载一次 1~2GB 很贵）
 _FW_CACHE: dict = {}
+_MLX_REPOS = {
+    "tiny": "mlx-community/whisper-tiny",
+    "base": "mlx-community/whisper-base",
+    "small": "mlx-community/whisper-small",
+    "medium": "mlx-community/whisper-medium",
+    "large": "mlx-community/whisper-large-v3",
+}
 
 
 def _to_simplified(text: str) -> str:
@@ -227,10 +276,12 @@ def _to_simplified(text: str) -> str:
         return text
 
 
-# ---- OpenVINO + Intel GPU 引擎（核显/Arc 加速；实测 small 比 CPU 快约 2.6x）----
+# ---- Legacy OpenVINO path ----
+#
+# macOS_branch 默认走 faster-whisper CPU。旧 OpenVINO 路径保留为非 macOS
+# 兼容兜底；在 Darwin 上不探测 Intel Linux GPU 栈，避免启动时多余失败。
 _OV_DEVICES = None
 _OV_PIPE_CACHE: dict = {}
-# 单块 iGPU：并发 generate 既不安全也无意义，GPU 推理一律串行
 _OV_LOCK = threading.Lock()
 
 
@@ -238,6 +289,9 @@ def _ov_devices() -> list:
     """OpenVINO 可见设备，结果缓存。没装 openvino 就返回空列表。"""
     global _OV_DEVICES
     if _OV_DEVICES is None:
+        if sys.platform == "darwin":
+            _OV_DEVICES = []
+            return _OV_DEVICES
         try:
             import openvino as ov
             _OV_DEVICES = list(ov.Core().available_devices)
@@ -301,23 +355,32 @@ def _whisper_media_openvino(media: Path, model: str,
 def _whisper_media(media: Path, work: Path, model: str,
                    duration: float, progress_cb: ProgressCb) -> str:
     """对本地音/视频文件转写。三层引擎，从快到稳自动回落：
-      1) OpenVINO + Intel GPU（最快，需有 GPU 且 .ovmodels 里有对应尺寸模型）
+      1) MLX Whisper（Apple Silicon GPU）
       2) faster-whisper（CPU int8）
-      3) 旧 openai-whisper CLI（最稳的兜底）
+      3) 旧 openai-whisper CLI（兼容兜底）
+      4) 非 macOS 环境保留 OpenVINO 旧路径
     输出统一转简体。"""
     if duration <= 0:
         duration = _ffprobe_duration(media)
 
-    # 1) OpenVINO GPU 优先
-    try:
-        return _to_simplified(_whisper_media_openvino(media, model, duration, progress_cb))
-    except (ImportError, FileNotFoundError):
-        pass  # 没装 openvino / 没该尺寸模型：静默降级到 CPU
-    except Exception as e:
-        progress_cb("transcribing", 8,
-                    f"GPU 转写不可用（{type(e).__name__}），改用 CPU faster-whisper…")
+    if sys.platform != "darwin":
+        try:
+            return _to_simplified(_whisper_media_openvino(media, model, duration, progress_cb))
+        except (ImportError, FileNotFoundError):
+            pass
+        except Exception as e:
+            progress_cb("transcribing", 8,
+                        f"GPU 转写不可用（{type(e).__name__}），改用 CPU faster-whisper…")
 
-    # 2) faster-whisper CPU
+    if sys.platform == "darwin" and platform_machine() == "arm64":
+        try:
+            return _to_simplified(_whisper_media_mlx(media, model, duration, progress_cb))
+        except ImportError:
+            pass
+        except Exception as e:
+            progress_cb("transcribing", 10,
+                        f"MLX GPU 转写不可用（{type(e).__name__}），回落 CPU…")
+
     try:
         text = _whisper_media_faster(media, model, duration, progress_cb)
     except ImportError:
@@ -329,6 +392,35 @@ def _whisper_media(media: Path, work: Path, model: str,
     return _to_simplified(text)
 
 
+def platform_machine() -> str:
+    import platform
+    return platform.machine().lower()
+
+
+def _whisper_media_mlx(media: Path, model: str,
+                       duration: float, progress_cb: ProgressCb) -> str:
+    """Apple Silicon GPU transcription via MLX."""
+    import mlx.core as mx
+    import mlx_whisper
+
+    repo = os.getenv("MLX_WHISPER_REPO") or _MLX_REPOS.get(model, _MLX_REPOS["small"])
+    mins = duration / 60 if duration > 0 else 0
+    progress_cb("transcribing", 10,
+                f"MLX GPU({model}) 转写中…（约 {mins:.1f} 分钟音频，首次会下载模型）")
+    mx.set_default_device(mx.gpu)
+    result = mlx_whisper.transcribe(
+        str(media),
+        path_or_hf_repo=repo,
+        language="zh",
+        task="transcribe",
+        verbose=False,
+    )
+    text = result.get("text", "") if isinstance(result, dict) else str(result)
+    if not text.strip():
+        raise RuntimeError("MLX Whisper 没产出文本")
+    return text
+
+
 def _whisper_media_faster(media: Path, model: str,
                           duration: float, progress_cb: ProgressCb) -> str:
     """faster-whisper(CTranslate2 + int8 量化 + VAD 静音过滤)。"""
@@ -337,7 +429,7 @@ def _whisper_media_faster(media: Path, model: str,
     wm = _FW_CACHE.get(model)
     if wm is None:
         progress_cb("transcribing", 6,
-                    f"加载模型 {model}（首次会下载，约 1~2GB，仅一次）…")
+                    f"加载模型 {model}（首次会下载，仅一次）…")
         # device=cpu + int8：无 GPU 时最快的组合；cpu_threads=0 让 CT2 自适应
         wm = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=0)
         _FW_CACHE[model] = wm
@@ -445,13 +537,16 @@ async def _dy_fetch_metas(sec_uid: str, cookie_header: str, interval: str,
                           progress_cb: ProgressCb) -> list[dict]:
     """用 f2 SDK 取该用户作品列表（只取信息、不下视频），按日期区间过滤。
     返回 [{aweme_id, title, music_url, vdur_s}, ...]。"""
+    _prepare_f2_douyin()
     from f2.apps.douyin.handler import DouyinHandler
+    f2_path = _ROOT / ".work" / "f2_meta"
+    f2_path.mkdir(parents=True, exist_ok=True)
     kwargs = {
         "headers": {"User-Agent": _UA, "Referer": "https://www.douyin.com/"},
         "cookie": cookie_header,
         "proxies": {"http://": None, "https://": None},
         "timeout": 30, "max_retries": 5, "max_connections": 5, "max_tasks": 5,
-        "page_counts": 20, "mode": "post", "path": "/tmp", "interval": "all",
+        "page_counts": 20, "mode": "post", "path": str(f2_path), "interval": "all",
     }
     handler = DouyinHandler(kwargs)
     metas: list[dict] = []
@@ -510,8 +605,13 @@ def download_douyin_user(url: str, work: Path, cookie_header: str,
     progress_cb("fetching_info", 3, f"抖音主页：取作品列表（{interval}）…")
     metas = asyncio.run(_dy_fetch_metas(sec_uid, cookie_header, interval, progress_cb))
     if not metas:
+        if not cookie_header:
+            raise RuntimeError(
+                "抖音主页作品列表返回为空。当前未配置 cookies.txt，"
+                "请先在浏览器登录抖音后导出 cookies.txt 放到项目根目录，再重启服务。"
+            )
         raise RuntimeError(
-            "没抓到作品（列表为空）。可能：主页链接不对/该区间内无作品/cookies 失效。")
+            "没抓到作品（列表为空）。可能：主页链接不对/该区间内无作品/cookies 已失效。")
 
     # 断点续传：跳过已转写过的作品（落稿文件名 = _safe_name(标题)）
     if done_dir is not None:
@@ -573,14 +673,25 @@ def transcribe_file(media: Path, title: str, source: str, outdir: Path, *,
 def tools_status() -> dict:
     """检查依赖是否就绪，给前端提示。"""
     import importlib.util
+    faster = importlib.util.find_spec("faster_whisper") is not None
+    mlx_ready = (
+        sys.platform == "darwin"
+        and platform_machine() == "arm64"
+        and importlib.util.find_spec("mlx_whisper") is not None
+    )
     return {
+        "platform": "macOS" if sys.platform == "darwin" else sys.platform,
         "yt-dlp": shutil.which("yt-dlp") is not None,
         "whisper": shutil.which("whisper") is not None,
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "f2": shutil.which("f2") is not None,
         # faster-whisper 是 Python 库不是命令行，用 find_spec 检测；装了就走加速
-        "faster-whisper": importlib.util.find_spec("faster_whisper") is not None,
-        # OpenVINO 能看到 Intel GPU，且至少有一个尺寸的 OV 模型，才算 GPU 加速可用
-        "openvino-gpu": ("GPU" in _ov_devices()) and any(
-            _ov_model_dir(s) for s in ("small", "medium", "large")),
+        "faster-whisper": faster,
+        "mlx-whisper": mlx_ready,
+        "openvino-gpu": False if sys.platform == "darwin" else (
+            ("GPU" in _ov_devices()) and any(_ov_model_dir(s) for s in ("small", "medium", "large"))
+        ),
+        "acceleration": "MLX Apple GPU" if mlx_ready else (
+            "faster-whisper CPU" if faster else "openai-whisper CPU"
+        ),
     }
